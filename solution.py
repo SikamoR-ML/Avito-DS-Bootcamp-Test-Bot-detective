@@ -169,29 +169,6 @@ def score_report(label: str, y: np.ndarray, p: np.ndarray) -> None:
           f"PR-AUC={average_precision_score(y, p):.5f} ROC-AUC={roc_auc_score(y, p):.5f}")
 
 
-def report_operating_point(y: np.ndarray, p: np.ndarray, event_counts: np.ndarray) -> None:
-    """Show the best local threshold, only for interpretation; submission has scores."""
-    order = np.argsort(-p, kind="mergesort")
-    sorted_p, sorted_y = p[order], y[order]
-    ends = np.r_[sorted_p[1:] != sorted_p[:-1], True]
-    tp = np.cumsum(sorted_y)[ends]
-    selected_n = np.arange(1, len(y) + 1)[ends]
-    precision = tp / selected_n
-    recall = tp / y.sum()
-    eligible = np.flatnonzero(recall >= 0.70)
-    best = eligible[np.argmax(precision[eligible])]
-    threshold = sorted_p[ends][best]
-    selected = p >= threshold
-    bot_events = event_counts[y == 1].sum()
-    human_events = event_counts[y == 0].sum()
-    removed_bot_events = event_counts[(y == 1) & selected].sum()
-    removed_human_events = event_counts[(y == 0) & selected].sum()
-    print(f"Validation operating point: threshold={threshold:.6f}, TP={tp[best]}, "
-          f"FP={selected_n[best] - tp[best]}, recall={recall[best]:.5f}")
-    print(f"Within-window events removed: bot={removed_bot_events}/{bot_events}, "
-          f"human={removed_human_events}/{human_events}")
-
-
 def main() -> None:
     train = pd.read_csv(ROOT / "data/train.csv")
     test = pd.read_csv(ROOT / "data/test.csv")
@@ -243,8 +220,6 @@ def main() -> None:
     larger_score = larger.predict_proba(train_x.loc[valid_ids])[:, 1]
     ensemble_score = (primary_score + larger_score) / 2
     score_report("Two-model mean", y[valid], ensemble_score)
-    report_operating_point(y[valid], ensemble_score,
-                           train_x.loc[valid_ids, "n_events"].fillna(0).to_numpy())
     for train_end, valid_end in (("2026-04-10", "2026-04-13"), ("2026-04-12", "2026-04-16")):
         earlier_fit = train.window_start_ts < train_end
         earlier_valid = (train.window_start_ts >= train_end) & (train.window_start_ts < valid_end)
