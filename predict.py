@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from solution import ROOT, as_catboost_features, make_features
+from extra_features import make_ua_query_features
 
 
 def predict(test_path: Path, events_path: Path, artifacts_dir: Path, output_path: Path) -> None:
@@ -27,17 +28,23 @@ def predict(test_path: Path, events_path: Path, artifacts_dir: Path, output_path
     for col, levels in schema["categorical_levels"].items():
         features[col] = pd.Categorical(features[col], categories=levels)
     cat_features = as_catboost_features(features, list(schema["categorical_levels"]))
+    plus = features.join(make_ua_query_features(test, events))
+    plus = plus.reindex(columns=schema.get("feature_columns_plus", schema["feature_columns"]))
+    plus_cat = as_catboost_features(plus, list(schema["categorical_levels"]))
+    numeric_frames = {"base": features, "plus": plus}
+    categorical_frames = {"base": cat_features, "plus": plus_cat}
     scores = np.zeros(len(test), dtype=float)
-    for family, weight, filename in zip(
-        schema["model_families"], schema["weights"], schema["model_files"]
+    feature_sets = schema.get("model_feature_set", ["base"] * len(schema["model_files"]))
+    for family, weight, filename, feature_set in zip(
+        schema["model_families"], schema["weights"], schema["model_files"], feature_sets
     ):
         model_path = artifacts_dir / filename
         if family == "lightgbm":
-            scores += weight * lgb.Booster(model_file=str(model_path)).predict(features)
+            scores += weight * lgb.Booster(model_file=str(model_path)).predict(numeric_frames[feature_set])
         elif family == "catboost":
             model = catboost.CatBoostClassifier()
             model.load_model(str(model_path))
-            scores += weight * model.predict_proba(cat_features)[:, 1]
+            scores += weight * model.predict_proba(categorical_frames[feature_set])[:, 1]
         else:
             raise ValueError(f"Unknown model family: {family}")
     if not np.isfinite(scores).all() or not np.all((0 <= scores) & (scores <= 1)):

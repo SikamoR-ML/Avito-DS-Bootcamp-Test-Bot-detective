@@ -18,6 +18,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
 from metric import precision_at_recall
+from extra_features import make_ua_query_features
 
 
 ROOT = Path(__file__).resolve().parent
@@ -183,6 +184,7 @@ def main() -> None:
     events = pd.read_csv(ROOT / "data/events.csv.gz")
     cookies = pd.concat([train.drop(columns="target"), test], ignore_index=True)
     x = make_features(cookies, events)
+    x_plus = pd.concat([x, make_ua_query_features(cookies, events)], axis=1)
     assert x.index.is_unique and not x.index.hasnans
     train_x = x.loc[train.cookie_id].copy()
     test_x = x.loc[test.cookie_id].copy()
@@ -193,6 +195,14 @@ def main() -> None:
         test_x[col] = pd.Categorical(test_x[col], categories=categories)
     cat_train_x = as_catboost_features(train_x, cat_cols)
     cat_test_x = as_catboost_features(test_x, cat_cols)
+    plus_train_x = x_plus.loc[train.cookie_id].copy()
+    plus_test_x = x_plus.loc[test.cookie_id].copy()
+    for col in cat_cols:
+        categories = train_x[col].cat.categories
+        plus_train_x[col] = pd.Categorical(plus_train_x[col], categories=categories)
+        plus_test_x[col] = pd.Categorical(plus_test_x[col], categories=categories)
+    plus_cat_train_x = as_catboost_features(plus_train_x, cat_cols)
+    plus_cat_test_x = as_catboost_features(plus_test_x, cat_cols)
     cat_params = dict(
         iterations=650, depth=5, learning_rate=0.04, l2_leaf_reg=5,
         loss_function="Logloss", verbose=False, thread_count=4,
@@ -269,37 +279,57 @@ def main() -> None:
     final_larger.fit(train_x, y, categorical_feature=cat_cols)
     final_cat = catboost.CatBoostClassifier(**cat_params)
     final_cat.fit(cat_train_x, y)
+    final_plus = lgb.LGBMClassifier(**{**params, "n_estimators": best_rounds})
+    final_plus.fit(plus_train_x, y, categorical_feature=cat_cols)
+    final_plus_larger = lgb.LGBMClassifier(**larger_params)
+    final_plus_larger.fit(plus_train_x, y, categorical_feature=cat_cols)
+    final_plus_cat = catboost.CatBoostClassifier(**cat_params)
+    final_plus_cat.fit(plus_cat_train_x, y)
     ARTIFACTS.mkdir(exist_ok=True)
-    model_files = ["model_15_leaves.txt", "model_31_leaves.txt", "model_catboost.cbm"]
-    final.booster_.save_model(str(ARTIFACTS / model_files[0]))
-    final_larger.booster_.save_model(str(ARTIFACTS / model_files[1]))
+    model_files = ["model_15_leaves.txt", "model_31_leaves.txt", "model_catboost.cbm",
+                   "model_15_leaves_plus.txt", "model_31_leaves_plus.txt", "model_catboost_plus.cbm"]
+    for trained, filename in ((final, model_files[0]), (final_larger, model_files[1]),
+                              (final_plus, model_files[3]), (final_plus_larger, model_files[4])):
+        trained.booster_.save_model(str(ARTIFACTS / filename))
     final_cat.save_model(str(ARTIFACTS / model_files[2]))
+    final_plus_cat.save_model(str(ARTIFACTS / model_files[5]))
+    weights = [0.14, 0.14, 0.12, 0.21, 0.21, 0.18]
     schema = {
-        "model_type": "weighted_lightgbm_catboost_ensemble",
-        "model_families": ["lightgbm", "lightgbm", "catboost"],
+        "model_type": "baseline_and_ua_query_weighted_ensemble",
+        "model_families": ["lightgbm", "lightgbm", "catboost"] * 2,
         "model_files": model_files,
-        "weights": [0.35, 0.35, 0.30],
+        "model_feature_set": ["base"] * 3 + ["plus"] * 3,
+        "weights": weights,
         "lightgbm_version": lgb.__version__,
         "catboost_version": catboost.__version__,
         "feature_columns": train_x.columns.tolist(),
+        "feature_columns_plus": plus_train_x.columns.tolist(),
         "categorical_levels": {col: train_x[col].cat.categories.tolist() for col in cat_cols},
         "random_state": SEED,
-        "n_estimators": [best_rounds, larger_params["n_estimators"], cat_params["iterations"]],
+        "n_estimators": [best_rounds, larger_params["n_estimators"], cat_params["iterations"]] * 2,
     }
     (ARTIFACTS / "feature_schema.json").write_text(
         json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     scores = (
-        0.35 * final.predict_proba(test_x)[:, 1]
-        + 0.35 * final_larger.predict_proba(test_x)[:, 1]
-        + 0.30 * final_cat.predict_proba(cat_test_x)[:, 1]
+        weights[0] * final.predict_proba(test_x)[:, 1]
+        + weights[1] * final_larger.predict_proba(test_x)[:, 1]
+        + weights[2] * final_cat.predict_proba(cat_test_x)[:, 1]
+        + weights[3] * final_plus.predict_proba(plus_test_x)[:, 1]
+        + weights[4] * final_plus_larger.predict_proba(plus_test_x)[:, 1]
+        + weights[5] * final_plus_cat.predict_proba(plus_cat_test_x)[:, 1]
     )
     loaded_cat = catboost.CatBoostClassifier()
     loaded_cat.load_model(str(ARTIFACTS / model_files[2]))
+    loaded_plus_cat = catboost.CatBoostClassifier()
+    loaded_plus_cat.load_model(str(ARTIFACTS / model_files[5]))
     saved_scores = (
-        0.35 * lgb.Booster(model_file=str(ARTIFACTS / model_files[0])).predict(test_x)
-        + 0.35 * lgb.Booster(model_file=str(ARTIFACTS / model_files[1])).predict(test_x)
-        + 0.30 * loaded_cat.predict_proba(cat_test_x)[:, 1]
+        weights[0] * lgb.Booster(model_file=str(ARTIFACTS / model_files[0])).predict(test_x)
+        + weights[1] * lgb.Booster(model_file=str(ARTIFACTS / model_files[1])).predict(test_x)
+        + weights[2] * loaded_cat.predict_proba(cat_test_x)[:, 1]
+        + weights[3] * lgb.Booster(model_file=str(ARTIFACTS / model_files[3])).predict(plus_test_x)
+        + weights[4] * lgb.Booster(model_file=str(ARTIFACTS / model_files[4])).predict(plus_test_x)
+        + weights[5] * loaded_plus_cat.predict_proba(plus_cat_test_x)[:, 1]
     )
     assert np.allclose(scores, saved_scores, rtol=0, atol=1e-12)
     submission = pd.DataFrame({"cookie_id": test.cookie_id, "score": scores})
