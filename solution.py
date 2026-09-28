@@ -4,6 +4,7 @@ Python 3.12; run from the project directory: python solution.py
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import lightgbm as lgb
@@ -19,6 +20,7 @@ from metric import precision_at_recall
 
 
 ROOT = Path(__file__).resolve().parent
+ARTIFACTS = ROOT / "artifacts"
 SEED = 2026
 EVENT_TYPES = [
     "search_results_view", "item_view", "photo_swipe", "seller_page_view",
@@ -240,13 +242,35 @@ def main() -> None:
     final.fit(train_x, y, categorical_feature=cat_cols)
     final_larger = lgb.LGBMClassifier(**larger_params)
     final_larger.fit(train_x, y, categorical_feature=cat_cols)
+    ARTIFACTS.mkdir(exist_ok=True)
+    model_files = ["model_15_leaves.txt", "model_31_leaves.txt"]
+    final.booster_.save_model(str(ARTIFACTS / model_files[0]))
+    final_larger.booster_.save_model(str(ARTIFACTS / model_files[1]))
+    schema = {
+        "model_type": "mean_of_two_lightgbm_classifiers",
+        "model_files": model_files,
+        "weights": [0.5, 0.5],
+        "feature_columns": train_x.columns.tolist(),
+        "categorical_levels": {col: train_x[col].cat.categories.tolist() for col in cat_cols},
+        "random_state": SEED,
+        "n_estimators": [best_rounds, larger_params["n_estimators"]],
+    }
+    (ARTIFACTS / "feature_schema.json").write_text(
+        json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     scores = (final.predict_proba(test_x)[:, 1] + final_larger.predict_proba(test_x)[:, 1]) / 2
+    saved_scores = sum(
+        weight * lgb.Booster(model_file=str(ARTIFACTS / filename)).predict(test_x)
+        for weight, filename in zip(schema["weights"], model_files)
+    )
+    assert np.allclose(scores, saved_scores, rtol=0, atol=1e-12)
     submission = pd.DataFrame({"cookie_id": test.cookie_id, "score": scores})
     assert submission.cookie_id.equals(test.cookie_id)
     assert submission.cookie_id.is_unique and submission.score.between(0, 1).all()
     assert submission.notna().all().all()
     submission.to_csv(ROOT / "submission.csv", index=False)
     print(f"Saved {ROOT / 'submission.csv'}: {len(submission)} rows")
+    print(f"Saved fitted ensemble and feature schema to {ARTIFACTS}")
 
 
 if __name__ == "__main__":
