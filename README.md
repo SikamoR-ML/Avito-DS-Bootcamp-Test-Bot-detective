@@ -1,0 +1,1 @@
+# Avito-DS-Bootcamp-Test-Bot-detective
