@@ -95,7 +95,9 @@ def make_features(cookies: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
             f[col] = 0
         f[f"share_{name}"] = f[col] / f.n_events
     for col in ("item_id", "item_category", "item_location", "search_query", "user_agent"):
-        f[f"top_share_{col}"] = g[col].agg(lambda s: s.value_counts(normalize=True).iloc[0] if s.notna().any() else np.nan)
+        f[f"top_share_{col}"] = g[col].agg(
+            lambda s: s.value_counts(normalize=True).iloc[0] if s.notna().any() else np.nan
+        )
     for col in ("item_id", "item_category", "item_location", "search_query", "seller_type", "pointer_x"):
         f[f"fraction_filled_{col}"] = g[col].count() / f.n_events
     for col in ("search_page", "query_length", "query_words", "pointer_x", "pointer_y", "second_of_day"):
@@ -107,7 +109,9 @@ def make_features(cookies: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     f["events_per_span_hour"] = f.n_events / (f.span_seconds / 3600 + 1)
     f["items_per_view"] = f.unique_item_id / f.count_event_name_item_view.clip(lower=1)
     f["queries_per_search"] = f.unique_search_query / f.count_event_name_search_results_view.clip(lower=1)
-    f["contact_per_item"] = (f.count_event_name_contact_phone_show + f.count_event_name_contact_chat_open) / f.count_event_name_item_view.clip(lower=1)
+    f["contact_per_item"] = (
+        f.count_event_name_contact_phone_show + f.count_event_name_contact_chat_open
+    ) / f.count_event_name_item_view.clip(lower=1)
     f["photo_per_item"] = f.count_event_name_photo_swipe / f.count_event_name_item_view.clip(lower=1)
     f["captcha_per_event"] = f.count_event_name_captcha_shown / f.n_events
     f["late_night_share"] = e.hour.between(0, 5).groupby(e.cookie_id).mean()
@@ -122,7 +126,9 @@ def make_features(cookies: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     for threshold in (0, 1, 2, 5, 10, 30, 60, 300):
         f[f"gap_le_{threshold}"] = e.gap.le(threshold).groupby(e.cookie_id).sum() / (f.n_events - 1).clip(lower=1)
     f["gap_cv"] = f.gap_std / f.gap_mean.replace(0, np.nan)
-    f["duplicate_event_share"] = e.duplicated(subset=["cookie_id", "event_ts", "eid", "item_id", "search_query"]).groupby(e.cookie_id).mean()
+    f["duplicate_event_share"] = e.duplicated(
+        subset=["cookie_id", "event_ts", "eid", "item_id", "search_query"]
+    ).groupby(e.cookie_id).mean()
 
     # Repeated search pages and repeated item views reveal crawl patterns.
     e["prev_event"] = g.event_name.shift()
@@ -131,10 +137,20 @@ def make_features(cookies: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     for left, right in (("search_results_view", "item_view"), ("item_view", "item_view"),
                         ("item_view", "photo_swipe"), ("item_view", "contact_phone_show"),
                         ("search_results_view", "search_results_view")):
-        f[f"transition_{left}_to_{right}"] = ((e.prev_event == left) & (e.event_name == right)).groupby(e.cookie_id).sum()
-    f["same_item_in_row"] = ((e.item_id == e.prev_item) & e.item_id.notna()).fillna(False).groupby(e.cookie_id).sum()
-    f["page_step_one"] = ((e.search_page - e.prev_page == 1) & (e.event_name == "search_results_view")).groupby(e.cookie_id).sum()
-    f["deep_search_share"] = e.search_page.ge(5).groupby(e.cookie_id).sum() / f.count_event_name_search_results_view.clip(lower=1)
+        f[f"transition_{left}_to_{right}"] = (
+            (e.prev_event == left) & (e.event_name == right)
+        ).groupby(e.cookie_id).sum()
+    f["same_item_in_row"] = (
+        ((e.item_id == e.prev_item) & e.item_id.notna()).fillna(False)
+        .groupby(e.cookie_id).sum()
+    )
+    f["page_step_one"] = (
+        (e.search_page - e.prev_page == 1) & (e.event_name == "search_results_view")
+    ).groupby(e.cookie_id).sum()
+    f["deep_search_share"] = (
+        e.search_page.ge(5).groupby(e.cookie_id).sum()
+        / f.count_event_name_search_results_view.clip(lower=1)
+    )
     f["pointer_unique_x"] = g.pointer_x.nunique()
     f["pointer_unique_y"] = g.pointer_y.nunique()
 
@@ -198,8 +214,14 @@ def main() -> None:
     print(f"Features: {train_x.shape[1]}; train={fit.sum()}, validation={valid.sum()}, positives={y[valid].sum()}")
 
     # Transparent baseline: event counts, age and volume with logistic regression.
-    basic = ["cookie_age_days", "n_events", "unique_item_id", "unique_search_query"] + [f"count_event_name_{name}" for name in EVENT_TYPES]
-    baseline = make_pipeline(SimpleImputer(strategy="constant", fill_value=0), StandardScaler(), LogisticRegression(max_iter=1000, random_state=SEED))
+    basic = ["cookie_age_days", "n_events", "unique_item_id", "unique_search_query"] + [
+        f"count_event_name_{name}" for name in EVENT_TYPES
+    ]
+    baseline = make_pipeline(
+        SimpleImputer(strategy="constant", fill_value=0),
+        StandardScaler(),
+        LogisticRegression(max_iter=1000, random_state=SEED),
+    )
     baseline.fit(train_x.loc[fit_ids, basic], y[fit])
     score_report("Baseline", y[valid], baseline.predict_proba(train_x.loc[valid_ids, basic])[:, 1])
 
@@ -248,6 +270,8 @@ def main() -> None:
     final_larger.booster_.save_model(str(ARTIFACTS / model_files[1]))
     schema = {
         "model_type": "mean_of_two_lightgbm_classifiers",
+        "artifact_format": "LightGBM native Booster text",
+        "lightgbm_version": lgb.__version__,
         "model_files": model_files,
         "weights": [0.5, 0.5],
         "feature_columns": train_x.columns.tolist(),

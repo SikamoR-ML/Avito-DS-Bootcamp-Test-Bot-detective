@@ -1,5 +1,7 @@
 {
   "model_type": "mean_of_two_lightgbm_classifiers",
+  "artifact_format": "LightGBM native Booster text",
+  "lightgbm_version": "4.7.0",
   "model_files": [
     "model_15_leaves.txt",
     "model_31_leaves.txt"
