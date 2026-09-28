@@ -1,0 +1,15 @@
+# Input data are supplied separately to the reviewer.
+data/
+bot_detection_challenge.zip
+quickstart.ipynb
+sample_submission.csv
+
+# Local Python artifacts.
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+*.log
+.DS_Store
+Thumbs.db
