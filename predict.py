@@ -1,15 +1,16 @@
-﻿"""Predict cookie scores with the saved LightGBM ensemble, without retraining."""
+"""Predict cookie scores with the saved tree ensemble, without retraining."""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
 
+import catboost
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from solution import ROOT, make_features
+from solution import ROOT, as_catboost_features, make_features
 
 
 def predict(test_path: Path, events_path: Path, artifacts_dir: Path, output_path: Path) -> None:
@@ -25,10 +26,20 @@ def predict(test_path: Path, events_path: Path, artifacts_dir: Path, output_path
     features = features.reindex(columns=schema["feature_columns"])
     for col, levels in schema["categorical_levels"].items():
         features[col] = pd.Categorical(features[col], categories=levels)
-    scores = sum(
-        weight * lgb.Booster(model_file=str(artifacts_dir / filename)).predict(features)
-        for weight, filename in zip(schema["weights"], schema["model_files"])
-    )
+    cat_features = as_catboost_features(features, list(schema["categorical_levels"]))
+    scores = np.zeros(len(test), dtype=float)
+    for family, weight, filename in zip(
+        schema["model_families"], schema["weights"], schema["model_files"]
+    ):
+        model_path = artifacts_dir / filename
+        if family == "lightgbm":
+            scores += weight * lgb.Booster(model_file=str(model_path)).predict(features)
+        elif family == "catboost":
+            model = catboost.CatBoostClassifier()
+            model.load_model(str(model_path))
+            scores += weight * model.predict_proba(cat_features)[:, 1]
+        else:
+            raise ValueError(f"Unknown model family: {family}")
     if not np.isfinite(scores).all() or not np.all((0 <= scores) & (scores <= 1)):
         raise ValueError("Predictions must be finite and within [0, 1]")
     pd.DataFrame({"cookie_id": test.cookie_id, "score": scores}).to_csv(output_path, index=False)

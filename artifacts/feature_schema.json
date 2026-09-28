@@ -1,15 +1,22 @@
 {
-  "model_type": "mean_of_two_lightgbm_classifiers",
-  "artifact_format": "LightGBM native Booster text",
-  "lightgbm_version": "4.7.0",
+  "model_type": "weighted_lightgbm_catboost_ensemble",
+  "model_families": [
+    "lightgbm",
+    "lightgbm",
+    "catboost"
+  ],
   "model_files": [
     "model_15_leaves.txt",
-    "model_31_leaves.txt"
+    "model_31_leaves.txt",
+    "model_catboost.cbm"
   ],
   "weights": [
-    0.5,
-    0.5
+    0.35,
+    0.35,
+    0.3
   ],
+  "lightgbm_version": "4.7.0",
+  "catboost_version": "1.2.8",
   "feature_columns": [
     "cookie_age_days",
     "created_hour",
@@ -172,6 +179,7 @@
   "random_state": 2026,
   "n_estimators": [
     274,
-    220
+    220,
+    650
   ]
 }

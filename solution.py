@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import catboost
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -169,6 +170,13 @@ def score_report(label: str, y: np.ndarray, p: np.ndarray) -> None:
           f"PR-AUC={average_precision_score(y, p):.5f} ROC-AUC={roc_auc_score(y, p):.5f}")
 
 
+def as_catboost_features(frame: pd.DataFrame, cat_cols: list[str]) -> pd.DataFrame:
+    out = frame.copy()
+    for col in cat_cols:
+        out[col] = out[col].astype(object).fillna("missing").astype(str)
+    return out
+
+
 def main() -> None:
     train = pd.read_csv(ROOT / "data/train.csv")
     test = pd.read_csv(ROOT / "data/test.csv")
@@ -183,6 +191,13 @@ def main() -> None:
         categories = pd.Index(x[col].dropna().unique())
         train_x[col] = pd.Categorical(train_x[col], categories=categories)
         test_x[col] = pd.Categorical(test_x[col], categories=categories)
+    cat_train_x = as_catboost_features(train_x, cat_cols)
+    cat_test_x = as_catboost_features(test_x, cat_cols)
+    cat_params = dict(
+        iterations=650, depth=5, learning_rate=0.04, l2_leaf_reg=5,
+        loss_function="Logloss", verbose=False, thread_count=4,
+        random_seed=SEED, allow_writing_files=False, cat_features=cat_cols,
+    )
     y = train.target.to_numpy()
     valid = train.window_start_ts >= "2026-04-16"
     fit = ~valid
@@ -219,7 +234,12 @@ def main() -> None:
     larger.fit(train_x.loc[fit_ids], y[fit], categorical_feature=cat_cols)
     larger_score = larger.predict_proba(train_x.loc[valid_ids])[:, 1]
     ensemble_score = (primary_score + larger_score) / 2
-    score_report("Two-model mean", y[valid], ensemble_score)
+    score_report("Two-model LightGBM mean", y[valid], ensemble_score)
+    cat_model = catboost.CatBoostClassifier(**cat_params)
+    cat_model.fit(cat_train_x.loc[fit_ids], y[fit])
+    cat_score = cat_model.predict_proba(cat_train_x.loc[valid_ids])[:, 1]
+    blended_score = 0.7 * ensemble_score + 0.3 * cat_score
+    score_report("LightGBM/CatBoost blend", y[valid], blended_score)
     for train_end, valid_end in (("2026-04-10", "2026-04-13"), ("2026-04-12", "2026-04-16")):
         earlier_fit = train.window_start_ts < train_end
         earlier_valid = (train.window_start_ts >= train_end) & (train.window_start_ts < valid_end)
@@ -231,7 +251,15 @@ def main() -> None:
         earlier_larger.fit(earlier_fit_x, y[earlier_fit], categorical_feature=cat_cols)
         earlier_score = (earlier_model.predict_proba(earlier_valid_x)[:, 1]
                          + earlier_larger.predict_proba(earlier_valid_x)[:, 1]) / 2
-        score_report(f"Temporal fold {train_end} to {valid_end}, two-model mean", y[earlier_valid], earlier_score)
+        earlier_cat = catboost.CatBoostClassifier(**cat_params)
+        earlier_cat.fit(cat_train_x.loc[train.loc[earlier_fit, "cookie_id"]], y[earlier_fit])
+        earlier_cat_score = earlier_cat.predict_proba(
+            cat_train_x.loc[train.loc[earlier_valid, "cookie_id"]]
+        )[:, 1]
+        score_report(
+            f"Temporal fold {train_end} to {valid_end}, LightGBM/CatBoost blend",
+            y[earlier_valid], 0.7 * earlier_score + 0.3 * earlier_cat_score,
+        )
     importance = pd.Series(model.feature_importances_, index=train_x.columns).sort_values(ascending=False)
     print("Top features:", importance.head(20).to_dict())
 
@@ -239,28 +267,39 @@ def main() -> None:
     final.fit(train_x, y, categorical_feature=cat_cols)
     final_larger = lgb.LGBMClassifier(**larger_params)
     final_larger.fit(train_x, y, categorical_feature=cat_cols)
+    final_cat = catboost.CatBoostClassifier(**cat_params)
+    final_cat.fit(cat_train_x, y)
     ARTIFACTS.mkdir(exist_ok=True)
-    model_files = ["model_15_leaves.txt", "model_31_leaves.txt"]
+    model_files = ["model_15_leaves.txt", "model_31_leaves.txt", "model_catboost.cbm"]
     final.booster_.save_model(str(ARTIFACTS / model_files[0]))
     final_larger.booster_.save_model(str(ARTIFACTS / model_files[1]))
+    final_cat.save_model(str(ARTIFACTS / model_files[2]))
     schema = {
-        "model_type": "mean_of_two_lightgbm_classifiers",
-        "artifact_format": "LightGBM native Booster text",
-        "lightgbm_version": lgb.__version__,
+        "model_type": "weighted_lightgbm_catboost_ensemble",
+        "model_families": ["lightgbm", "lightgbm", "catboost"],
         "model_files": model_files,
-        "weights": [0.5, 0.5],
+        "weights": [0.35, 0.35, 0.30],
+        "lightgbm_version": lgb.__version__,
+        "catboost_version": catboost.__version__,
         "feature_columns": train_x.columns.tolist(),
         "categorical_levels": {col: train_x[col].cat.categories.tolist() for col in cat_cols},
         "random_state": SEED,
-        "n_estimators": [best_rounds, larger_params["n_estimators"]],
+        "n_estimators": [best_rounds, larger_params["n_estimators"], cat_params["iterations"]],
     }
     (ARTIFACTS / "feature_schema.json").write_text(
         json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    scores = (final.predict_proba(test_x)[:, 1] + final_larger.predict_proba(test_x)[:, 1]) / 2
-    saved_scores = sum(
-        weight * lgb.Booster(model_file=str(ARTIFACTS / filename)).predict(test_x)
-        for weight, filename in zip(schema["weights"], model_files)
+    scores = (
+        0.35 * final.predict_proba(test_x)[:, 1]
+        + 0.35 * final_larger.predict_proba(test_x)[:, 1]
+        + 0.30 * final_cat.predict_proba(cat_test_x)[:, 1]
+    )
+    loaded_cat = catboost.CatBoostClassifier()
+    loaded_cat.load_model(str(ARTIFACTS / model_files[2]))
+    saved_scores = (
+        0.35 * lgb.Booster(model_file=str(ARTIFACTS / model_files[0])).predict(test_x)
+        + 0.35 * lgb.Booster(model_file=str(ARTIFACTS / model_files[1])).predict(test_x)
+        + 0.30 * loaded_cat.predict_proba(cat_test_x)[:, 1]
     )
     assert np.allclose(scores, saved_scores, rtol=0, atol=1e-12)
     submission = pd.DataFrame({"cookie_id": test.cookie_id, "score": scores})
